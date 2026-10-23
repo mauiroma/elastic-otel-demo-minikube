@@ -9,6 +9,8 @@ Operations manual: OpenTelemetry demo with Elastic on minikube (GCP VM + Elastic
 | **Estimated time** | 60-90 minutes |
 | **Expected result** | Demo reachable from a browser; VM, Kubernetes and application data visible in Kibana |
 
+This demo uses the [Elastic fork of the OpenTelemetry Demo](https://github.com/elastic/opentelemetry-demo.git) (OpenTelemetry Astronomy Shop), instrumented with EDOT.
+
 ## Repository contents
 
 ```
@@ -116,6 +118,7 @@ Observability covers two layers:
 - ECH deployment **9.0 or later** (required for the Managed OTLP endpoint).
 - **Fleet** enabled on the deployment (included in ECH).
 - Permissions to create agent policies, integrations and API keys.
+- No existing deployment? Create a free trial at [cloud.elastic.co/registration](https://cloud.elastic.co/registration), then from the Elastic Cloud console click **Create deployment**, choose **Elasticsearch (Elastic Cloud Hosted)**, and select a **9.0 or later** version.
 
 ### 2.3 Local workstation (Mac)
 
