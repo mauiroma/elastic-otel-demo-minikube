@@ -1,0 +1,22 @@
+# Demo overrides, applied AFTER the Elastic fork demo.yml (README section 11).
+# Usage:
+#   helm upgrade my-otel-demo open-telemetry/opentelemetry-demo --version 0.40.7 \
+#     -f ~/opentelemetry-demo/kubernetes/elastic-helm/demo.yml \
+#     -f helm/demo-overrides.yml -n otel-demo
+#   ./scripts/expose-nodeport.sh
+#
+# Note: envOverrides is a list and replaces the one in demo.yml,
+# so LOCUST_BROWSER_TRAFFIC_ENABLED must be kept here.
+
+components:
+  load-generator:
+    envOverrides:
+      - name: LOCUST_BROWSER_TRAFFIC_ENABLED
+        value: "false"
+      - name: LOCUST_USERS
+        value: "5"
+      - name: LOCUST_SPAWN_RATE
+        value: "1"
+    resources:
+      limits:
+        memory: 800Mi
