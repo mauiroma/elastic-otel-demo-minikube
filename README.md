@@ -100,6 +100,72 @@ Observability covers two layers:
 | Kubernetes nodes, pods, containers and events | EDOT Collector (`kubeletstats`, `k8s_cluster`, `k8sobjects`) |
 | Application traces, metrics and logs | EDOT SDKs → EDOT Collector → Managed OTLP endpoint |
 
+### 1.1 EDOT Architecture
+
+EDOT (Elastic Distribution of OpenTelemetry) is deployed in the cluster by the `opentelemetry-kube-stack` chart. The OpenTelemetry Operator manages three collector roles, each with a specific job, and all data leaves the cluster through a single point: the gateway.
+
+```mermaid
+flowchart LR
+    subgraph APPS["ns otel-demo"]
+        SVC["Demo microservices<br/>(EDOT / OTel SDKs)"]
+    end
+
+    subgraph OPS["ns opentelemetry-operator-system"]
+        OP["OpenTelemetry Operator<br/>(manages collector CRs)"]
+
+        subgraph DS["EDOT Collector: DaemonSet (1 per node)"]
+            DR["receivers: otlp 4317/4318,<br/>kubeletstats, filelog, hostmetrics"]
+            DP["processors: k8sattributes,<br/>resourcedetection, batch"]
+            DR --> DP
+        end
+
+        subgraph CL["EDOT Collector: Cluster (1 replica)"]
+            CR["receivers: k8s_cluster,<br/>k8sobjects (events)"]
+        end
+
+        subgraph GW["EDOT Collector: Gateway"]
+            GR["receiver: otlp"]
+            GP["processors: batch<br/>elasticapm connector (APM metrics)"]
+            GE["exporter: otlp + API key<br/>(secret elastic-secret-otel)"]
+            GR --> GP --> GE
+        end
+    end
+
+    subgraph ECH["Elastic Cloud Hosted"]
+        MOTLP["Managed OTLP endpoint"]
+        ES[("Elasticsearch<br/>traces-*, metrics-*, logs-*")]
+        KB["Kibana<br/>APM, Dashboards, Discover"]
+        MOTLP --> ES --> KB
+    end
+
+    SVC -- "OTLP traces, metrics, logs<br/>(daemon collector FQDN)" --> DR
+    NODE["Node, pod and container<br/>stats and logs"] -.-> DR
+    K8S["Kubernetes API server"] -.-> CR
+    OP -. "reconciles" .-> DS
+    OP -. "reconciles" .-> CL
+    OP -. "reconciles" .-> GW
+    DP -- OTLP --> GR
+    CR -- OTLP --> GR
+    GE -- "OTLP/HTTP + API key" --> MOTLP
+```
+
+| Component | Role | Data produced |
+|---|---|---|
+| **EDOT SDKs** (in the microservices) | Instrument the application code and export through OTLP | Traces, metrics, logs |
+| **OpenTelemetry Operator** | Creates and reconciles the collectors from the `OpenTelemetryCollector` resources | None (control plane) |
+| **EDOT Collector, DaemonSet** | Runs on every node. Receives application OTLP, reads kubelet stats and container logs, enriches with Kubernetes metadata (`k8sattributes`) | App telemetry, `kubeletstats`, container logs, host metrics |
+| **EDOT Collector, Cluster** | Single replica that queries the Kubernetes API, so cluster-level data is not duplicated per node | `k8s_cluster` metrics, `k8sobjects` events |
+| **EDOT Collector, Gateway** | Aggregation point: batches data, derives APM metrics, authenticates with the API key and exports | Everything, towards the Managed OTLP endpoint |
+| **Managed OTLP endpoint** | Native OTLP ingestion on ECH, no APM Server to manage | Data streams `traces-*`, `metrics-*`, `logs-*` |
+
+Why this layout:
+
+- **DaemonSet**: node-local collection (kubelet, logs) and a short hop for the applications.
+- **Cluster collector**: one replica avoids duplicate cluster metrics and events.
+- **Gateway**: credentials and egress are concentrated in one place, and scaling or tuning export does not touch the node collectors. If pods are `OOMKilled`, it can be scaled to 1 replica (section 14).
+
+The Elastic Agent on the VM (section 3) is a separate path: it is managed through Fleet and does not go through the EDOT collectors.
+
 ---
 
 ## 2. Requirements
@@ -419,6 +485,115 @@ For a pod in `CrashLoopBackOff` or `OOMKilled`:
 kubectl describe pod <pod-name>
 kubectl logs <pod-name> --previous
 ```
+
+### 8.4 [Optional] Send logs to a wired stream (retention per service)
+
+**Goal**: by default EDOT logs land in the classic data stream `logs-generic.otel-default`, with a single retention for all services. With **wired streams**, logs go to the `logs.otel` stream, where you can create one child stream per `service.name` and set a different retention on each.
+
+```
+EDOT Gateway ── elasticsearch.index = logs.otel ──► Managed OTLP endpoint
+                                                          │
+                                                   logs.otel (wired)
+                                      ┌──────────────┬────┴─────────┬──────────────┐
+                              logs.otel.checkout  logs.otel.cart  logs.otel.ad   (rest stays in
+                              retention 30d       retention 7d    retention 1d    logs.otel)
+```
+
+> Documentation: [Wired streams](https://www.elastic.co/docs/solutions/observability/streams/wired-streams)
+
+**Requirements**
+
+- Wired streams are in **Preview** from Elastic Stack 9.2. The `logs.otel` stream exists from **9.4**. On 9.2 and 9.3 use `logs` instead of `logs.otel` in every step below (the data is then normalized to OTel format by the root stream).
+- Phases 5 and 6 completed, with logs already visible in `logs-generic.otel-default`.
+
+**Step 1: tell EDOT where to write**
+
+Streams reads the resource attribute `elasticsearch.index`. Add a `transform` processor to the **logs pipeline of the EDOT Gateway** that sets it to `logs.otel`:
+
+```yaml
+processors:
+  transform/wired-logs:
+    log_statements:
+      - context: resource
+        statements:
+          - set(attributes["elasticsearch.index"], "logs.otel")
+```
+
+You can apply this **without Helm**, by patching the `OpenTelemetryCollector` resource that the Operator manages. The Operator reconciles the change and restarts the gateway pods by itself.
+
+On the VM:
+
+```bash
+NS=opentelemetry-operator-system
+
+# 1. find the gateway resource name (the one ending in "-gateway")
+kubectl get opentelemetrycollector -n $NS
+GW=$(kubectl get opentelemetrycollector -n $NS -o name | grep gateway)
+
+# 2. check the current logs pipeline
+kubectl get $GW -n $NS -o jsonpath='{.spec.config.service.pipelines.logs}'; echo
+
+# 3. add the processor and append it to the logs pipeline (existing processors are kept)
+kubectl patch $GW -n $NS --type=json -p '[
+  {"op":"add","path":"/spec/config/processors/transform~1wired-logs","value":
+    {"log_statements":[{"context":"resource","statements":["set(attributes[\"elasticsearch.index\"], \"logs.otel\")"]}]}},
+  {"op":"add","path":"/spec/config/service/pipelines/logs/processors/-","value":"transform/wired-logs"}
+]'
+
+# 4. wait for the gateway pods to restart and check the processor is loaded
+kubectl rollout status deployment -n $NS -l app.kubernetes.io/component=opentelemetry-collector --timeout=120s
+kubectl get $GW -n $NS -o jsonpath='{.spec.config.service.pipelines.logs.processors}'; echo
+```
+
+`transform~1wired-logs` is the JSON Patch escape for `transform/wired-logs` (`~1` stands for `/`). If step 2 shows no `processors` list or the patch fails with a path error, use `kubectl edit $GW -n $NS` and add the processor by hand under `spec.config.processors` and in `service.pipelines.logs.processors`.
+
+To set it on the DaemonSet instead, use the resource ending in `-daemon`. One place is enough: do not set it in both.
+
+> **Warning**: a patch made this way is overwritten by the next `helm upgrade` of the EDOT chart (including `./demo.sh k8s`). After an upgrade, run the patch again. If the processor is already present, the patch fails with a duplicate: check step 2 first.
+
+**Step 2: check that logs arrive in `logs.otel`**
+
+In Kibana **Streams**: the `logs.otel` stream shows new documents. In Discover, `FROM logs.otel` returns data and the new logs no longer increase `logs-generic.otel-default`.
+
+> **Note**: `logs-generic.otel-default` keeps receiving a small amount of documents even after the change. They are not logs: they are **span events** (for example `Enqueued` from Redis, `feature_flag.evaluation` from flagd) that travel inside the traces. The Elastic OTLP endpoint converts them into log documents and writes them to the default `logs-generic.otel-default`, because the `transform/wired-logs` processor is only in the `logs` pipeline, not in `traces`. You can recognize them because they all have `trace_id` and `event_name` and no `body` or `severity_text`. Real logs (container files, SDK logs) all go to `logs.otel`. To check:
+>
+> ```
+> FROM logs-generic.otel-default
+> | WHERE @timestamp > NOW() - 15 minutes
+> | STATS total = COUNT(*), with_trace = COUNT(trace_id), with_event_name = COUNT(event_name), with_body = COUNT(body.text)
+> ```
+>
+> Expected result: `total` equals `with_trace` and `with_event_name`, and `with_body` is `0`.
+
+**Step 3: partition by service**
+
+> Documentation: [Organize your data (Streams)](https://www.elastic.co/docs/solutions/observability/streams/management/partitioning)
+
+1. **Streams → `logs.otel` → Partitioning → Create partition**.
+2. Name: for example `checkout` (the child stream becomes `logs.otel.checkout`).
+3. Condition: field `resource.attributes.service.name`, operator `equals`, value `checkout`.
+4. Check the preview of matched documents, then **Save**.
+5. Repeat for each service that needs its own retention.
+
+Logs that match no partition stay in `logs.otel`, so the parent retention is the default for all other services.
+
+**Step 4: set retention per child stream**
+
+1. **Streams → `logs.otel.<service>` → Retention → Edit**.
+2. Turn off **Inherit from parent**, choose **Custom period** and set the days (for example `checkout` 30d, `ad` 1d).
+
+Child streams inherit the lifecycle of the parent until you override it.
+
+**Verification**
+
+- `logs.otel.checkout` contains only `service.name: checkout` documents and shows its own retention.
+- Rollback: remove `transform/wired-logs` from the pipeline (`kubectl edit $GW -n $NS`, or re-run `./demo.sh k8s`, which restores the chart defaults). New logs return to `logs-generic.otel-default`; documents already in the wired streams stay there until their retention expires.
+
+**Notes**
+
+- Partitioning is not retroactive: it applies to documents indexed after the rule is saved.
+- Each partition creates its own data stream. Keep them to the few services that really need a different retention.
+- Wired streams are in Preview: field names and UI paths may change between versions, so check them against the docs for your deployment version.
 
 ---
 
